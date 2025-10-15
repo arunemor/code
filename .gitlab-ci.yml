@@ -1,0 +1,118 @@
+stages:
+  - build
+  - lint
+  - test
+  - deploy
+  - smoke-test
+
+image: python:3.11  # Use a modern Python base image
+
+variables:
+    EC2_USER: ubuntu
+
+# --------------------------
+# 1. Build Stage: Prepare dependencies and artifact
+# --------------------------
+build-job:
+  stage: build
+  script:
+    - echo "Starting build process..."
+    - python --version
+    - pip install --upgrade pip
+    - pip install flask
+    - zip -r application_artifact.zip .  # Package everything
+    - echo "Build completed and artifact created."
+  
+  artifacts:
+    paths:
+      - application_artifact.zip
+      - venv/
+    expire_in: 1 day
+  only:
+    - main
+
+# --------------------------
+# 2. Lint Stage: Check Python code style with flake8 or pylint
+# --------------------------
+lint-job:
+  stage: lint
+  dependencies:
+    - build-job
+  script:
+    - echo "Running lint checks..."
+    - pip install flake8
+    - flake8 . --max-line-length=120
+    - echo "Linting passed successfully!"
+  only:
+    - main
+
+# --------------------------
+# 3. Unit Test Stage: Run pytest or unittest
+# --------------------------
+unit-test-job:
+  stage: test
+  dependencies:
+    - build-job
+  script:
+    - echo "Running unit tests..."
+    - pip install pytest
+    - pytest --maxfail=1 --disable-warnings -q
+    - echo "All unit tests passed."
+  only:
+    - main
+
+# --------------------------
+# 4. Deploy Stage: Copy build to EC2 and restart app
+# --------------------------
+deploy-job:
+  stage: deploy
+  image: alpine:latest
+  dependencies:
+    - build-job
+    - unit-test-job
+    - lint-job
+
+  before_script:
+    - apk add --no-cache openssh zip unzip
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+
+  script:
+    - echo "Starting deployment to EC2 instance: $EC2_HOST"
+    - scp -o StrictHostKeyChecking=no application_artifact.zip $EC2_USER@$EC2_HOST:/tmp/
+    - >
+      ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST "
+        sudo rm -rf $APP_DIR/*;
+        sudo mkdir -p $APP_DIR;
+        sudo mv /tmp/application_artifact.zip $APP_DIR/;
+        cd $APP_DIR;
+        sudo unzip -o application_artifact.zip;
+        sudo rm application_artifact.zip;
+        sudo systemctl restart my-python-app.service;
+      "
+    - echo "Deployment complete!"
+
+  environment:
+    name: production
+    url: http://$EC2_HOST
+  only:
+    - main
+
+# --------------------------
+# 5. Smoke Test Stage: Verify the app is running
+# --------------------------
+smoke-test-job:
+  stage: smoke-test
+  image: curlimages/curl:latest
+  needs: ["deploy-job"]
+  script:
+    - echo "Running smoke test against http://$EC2_HOST/health"
+    - curl -f --retry 5 --retry-delay 5 "http://$EC2_HOST/health" || (echo "Smoke test failed!" && exit 1)
+    - echo "Smoke test successful — app is healthy."
+  only:
+    - main
+
